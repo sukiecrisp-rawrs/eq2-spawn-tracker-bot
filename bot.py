@@ -1,6 +1,7 @@
 import os
 import json
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import discord
 from discord.ext import commands, tasks
@@ -13,6 +14,13 @@ from dotenv import load_dotenv
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 
+# Change this if you want a different canonical timezone
+# Examples:
+#   "America/Los_Angeles" (Pacific)
+#   "America/Chicago"
+#   "UTC"
+TIMEZONE = ZoneInfo("America/New_York")
+
 INTENTS = discord.Intents.all()
 bot = commands.Bot(command_prefix="!", intents=INTENTS)
 
@@ -20,8 +28,13 @@ DATA_FILE = "mobs_data.json"
 
 
 # -----------------------
-# Data helpers
+# Helpers: time & data
 # -----------------------
+
+def now_local() -> datetime:
+    """Current time in the bot's canonical timezone (aware datetime)."""
+    return datetime.now(TIMEZONE)
+
 
 def load_data():
     """Load the full JSON data file."""
@@ -108,13 +121,13 @@ def format_timedelta(delta: timedelta) -> str:
 
 def parse_time_str(time_str: str) -> datetime:
     """
-    Interpret HHMM or HMM as a *local time*.
+    Interpret HHMM or HMM as a time in the bot's canonical timezone.
 
     Example:
-      "2000" -> today at 20:00 local.
-      If that time is in the future relative to now, assume it was yesterday.
+      "2000" -> most recent 20:00 in TIMEZONE.
+      If that time hasn't happened yet today, assume it was yesterday.
     """
-    now = datetime.now()
+    now = now_local()
     time_str = time_str.strip()
     if not time_str.isdigit() or len(time_str) not in (3, 4):
         raise ValueError("Time must be HMM or HHMM, e.g. 215 or 0215.")
@@ -130,9 +143,11 @@ def parse_time_str(time_str: str) -> datetime:
         raise ValueError("Invalid hour/minute values.")
 
     dt = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
-    # If that time hasn't happened yet today, assume it was yesterday
+
+    # If that clock time is still in our future, assume it was yesterday
     if dt > now:
         dt -= timedelta(days=1)
+
     return dt
 
 
@@ -151,7 +166,7 @@ def update_window_from_tod_history(mob_data: dict):
         mob_data["learned_confidence"] = "LOW"
         return None, None, "LOW"
 
-    # Parse and sort TODs (naive local times)
+    # Parse and sort TODs (aware datetimes in TIMEZONE)
     times = sorted(datetime.fromisoformat(t) for t in history)
     intervals = []
     for a, b in zip(times, times[1:]):
@@ -190,7 +205,7 @@ def update_window_from_tod_history(mob_data: dict):
     return mob_data["min_respawn_hours"], mob_data["max_respawn_hours"], confidence
 
 
-def mob_status_line(mob_name: str, mob_data: dict, now_local: datetime) -> str:
+def mob_status_line(mob_name: str, mob_data: dict, now_time: datetime) -> str:
     """Build a single status line for a mob, including confidence info."""
     if not mob_data.get("tracking", False):
         return f"❌ {mob_data.get('display_name', mob_name)} — tracking OFF"
@@ -218,16 +233,16 @@ def mob_status_line(mob_name: str, mob_data: dict, now_local: datetime) -> str:
     earliest = base_time + timedelta(hours=min_h)
     latest = base_time + timedelta(hours=max_h)
 
-    if now_local < earliest:
-        until_open = earliest - now_local
+    if now_time < earliest:
+        until_open = earliest - now_time
         return (f"⏳ {mob_data.get('display_name', mob_name)} — window CLOSED, "
                 f"opens in **{format_timedelta(until_open)}**" + conf_suffix)
-    elif earliest <= now_local <= latest:
-        until_close = latest - now_local
+    elif earliest <= now_time <= latest:
+        until_close = latest - now_time
         return (f"✅ {mob_data.get('display_name', mob_name)} — **WINDOW OPEN**, "
                 f"~{format_timedelta(until_close)} left until late limit" + conf_suffix)
     else:
-        overdue = now_local - latest
+        overdue = now_time - latest
         return (f"🔥 {mob_data.get('display_name', mob_name)} — window OVERDUE by "
                 f"**{format_timedelta(overdue)}** (likely up / killed unseen)" + conf_suffix)
 
@@ -255,7 +270,7 @@ async def on_command_error(ctx, error):
 
 @tasks.loop(seconds=60)
 async def update_status_messages():
-    now_local = datetime.now()
+    now_time = now_local()
     all_data = load_data()
 
     for guild in bot.guilds:
@@ -281,7 +296,7 @@ async def update_status_messages():
             lines = []
             for key, mob_data in mobs.items():
                 if mob_data.get("tracking", False):
-                    lines.append(mob_status_line(key, mob_data, now_local))
+                    lines.append(mob_status_line(key, mob_data, now_time))
             if not lines:
                 content = "No mobs are currently set to tracking ON."
             else:
@@ -309,8 +324,8 @@ async def update_status_messages():
 
 @bot.command(help="Mark Time Of Death. Usage: !tod Mob Name [HHMM]")
 async def tod(ctx, *, mob_and_time: str):
-    """Record TOD and auto-learn window from TOD history (local time)."""
-    now_local = datetime.now()
+    """Record TOD and auto-learn window from TOD history (canonical timezone)."""
+    current = now_local()
 
     parts = mob_and_time.split()
     time_str = None
@@ -333,7 +348,7 @@ async def tod(ctx, *, mob_and_time: str):
             await ctx.send(f"Invalid time: {e}")
             return
     else:
-        tod_time = now_local
+        tod_time = current
 
     guild_data = get_guild_data(ctx.guild.id)
     mobs = guild_data["mobs"]
@@ -376,8 +391,8 @@ async def tod(ctx, *, mob_and_time: str):
 
 @bot.command(help="Mark a spawn time. Usage: !spawn Mob Name [HHMM]")
 async def spawn(ctx, *, mob_and_time: str):
-    """Record when you actually saw the mob spawn (local time)."""
-    now_local = datetime.now()
+    """Record when you actually saw the mob spawn (canonical timezone)."""
+    current = now_local()
 
     parts = mob_and_time.split()
     time_str = None
@@ -400,7 +415,7 @@ async def spawn(ctx, *, mob_and_time: str):
             await ctx.send(f"Invalid time: {e}")
             return
     else:
-        spawn_time = now_local
+        spawn_time = current
 
     guild_data = get_guild_data(ctx.guild.id)
     mobs = guild_data["mobs"]
@@ -532,7 +547,7 @@ async def setstatuschannel(ctx, channel: discord.TextChannel = None):
 
 @bot.command(help="Show immediate spawn status.")
 async def status(ctx):
-    now_local = datetime.now()
+    now_time = now_local()
     guild_data = get_guild_data(ctx.guild.id)
     mobs = guild_data.get("mobs", {})
 
@@ -543,7 +558,7 @@ async def status(ctx):
     lines = []
     for key, mob_data in mobs.items():
         if mob_data.get("tracking", False):
-            lines.append(mob_status_line(key, mob_data, now_local))
+            lines.append(mob_status_line(key, mob_data, now_time))
 
     if not lines:
         await ctx.send("No mobs currently have tracking enabled.")
@@ -562,4 +577,3 @@ if __name__ == "__main__":
         print("ERROR: DISCORD_TOKEN not found in environment.")
     else:
         bot.run(TOKEN)
-
