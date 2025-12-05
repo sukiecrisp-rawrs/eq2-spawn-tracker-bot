@@ -5,16 +5,17 @@ from zoneinfo import ZoneInfo
 
 import discord
 from discord.ext import commands, tasks
+from difflib import get_close_matches
 from dotenv import load_dotenv
 
-# -----------------------
-# Config & setup
-# -----------------------
+# ------------------------------------------------------------
+# Configuration & Setup
+# ------------------------------------------------------------
 
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 
-# Canonical EQ2 timezone: Eastern with DST (EST/EDT)
+# EQ2 canonical time zone (DST-aware)
 TIMEZONE = ZoneInfo("America/New_York")
 
 INTENTS = discord.Intents.all()
@@ -22,49 +23,31 @@ bot = commands.Bot(command_prefix="!", intents=INTENTS)
 
 DATA_FILE = "mobs_data.json"
 
-
-# -----------------------
-# Helpers: time & data
-# -----------------------
+# ------------------------------------------------------------
+# Core Helpers (Time & Data)
+# ------------------------------------------------------------
 
 def now_local() -> datetime:
-    """Current time in the bot's canonical timezone (aware datetime)."""
+    """Return current aware datetime in Eastern time."""
     return datetime.now(TIMEZONE)
 
-
 def load_data():
-    """Load the full JSON data file."""
+    """Load entire mobs_data.json into a Python dict."""
     if not os.path.exists(DATA_FILE):
         return {}
-    with open(DATA_FILE, "r", encoding="utf-8") as f:
-        try:
+    try:
+        with open(DATA_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
-        except json.JSONDecodeError:
-            return {}
-
+    except Exception:
+        return {}
 
 def save_data(data):
-    """Save the full JSON data file."""
+    """Persist full mob data to JSON storage."""
     with open(DATA_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
 
-
 def get_guild_data(guild_id):
-    """
-    Return the data dict for a single guild, always with a 'mobs' dict.
-
-    Overall structure in mobs_data.json is:
-    {
-        "guild_id_str": {
-            "status_channel_id": int | null,
-            "status_message_id": int | null,
-            "mobs": {
-                "mob_key": { ... }
-            }
-        },
-        ...
-    }
-    """
+    """Return or create guild-level block."""
     data = load_data()
     gid = str(guild_id)
 
@@ -77,36 +60,35 @@ def get_guild_data(guild_id):
         save_data(data)
         return data[gid]
 
-    guild_data = data[gid]
-    if "status_channel_id" not in guild_data:
-        guild_data["status_channel_id"] = None
-    if "status_message_id" not in guild_data:
-        guild_data["status_message_id"] = None
-    if "mobs" not in guild_data:
-        guild_data["mobs"] = {}
+    # Guarantee keys
+    if "status_channel_id" not in data[gid]:
+        data[gid]["status_channel_id"] = None
+    if "status_message_id" not in data[gid]:
+        data[gid]["status_message_id"] = None
+    if "mobs" not in data[gid]:
+        data[gid]["mobs"] = {}
 
     save_data(data)
-    return guild_data
+    return data[gid]
 
-
-def update_guild_data(guild_id, new_guild_data):
-    """Write back a single guild's data into the JSON file."""
+def update_guild_data(guild_id, gdata):
+    """Write back updated guild block."""
     data = load_data()
-    data[str(guild_id)] = new_guild_data
+    data[str(guild_id)] = gdata
     save_data(data)
-
 
 def normalize_mob_name(name: str) -> str:
-    """Canonical key for a mob name."""
+    """Canonical key format."""
     return name.strip().lower()
 
-
 def format_timedelta(delta: timedelta) -> str:
-    total_seconds = int(delta.total_seconds())
-    if total_seconds < 0:
-        total_seconds = -total_seconds
-    hours, remainder = divmod(total_seconds, 3600)
-    minutes, _ = divmod(remainder, 60)
+    """Format as Xm or Xh Ym."""
+    total = int(delta.total_seconds())
+    if total < 0:
+        total = -total
+    hours, rest = divmod(total, 3600)
+    minutes, _ = divmod(rest, 60)
+
     parts = []
     if hours:
         parts.append(f"{hours}h")
@@ -114,108 +96,153 @@ def format_timedelta(delta: timedelta) -> str:
         parts.append(f"{minutes}m")
     return " ".join(parts)
 
+# ------------------------------------------------------------
+# Time & Date Parsing
+# ------------------------------------------------------------
 
-def parse_time_str(time_str: str) -> datetime:
+def looks_like_time(tok: str) -> bool:
+    """Check if token is HMM or HHMM."""
+    return tok.isdigit() and len(tok) in (3, 4)
+
+def parse_date_str(date_str: str):
+    """Parse several common date formats."""
+    formats = ["%Y-%m-%d", "%Y/%m/%d", "%m/%d/%Y", "%m/%d/%y"]
+    for fmt in formats:
+        try:
+            return datetime.strptime(date_str, fmt).date()
+        except ValueError:
+            pass
+    raise ValueError("Date must be YYYY-MM-DD or MM/DD/YYYY")
+
+def parse_time_str(time_str: str, for_date=None) -> datetime:
     """
-    Interpret HHMM or HMM as a time in the bot's canonical timezone.
-
-    Example:
-      "2000" -> most recent 20:00 in TIMEZONE.
-      If that time hasn't happened yet today, assume it was yesterday.
+    Interpret HHMM as either an explicit date's time or the most recent such time.
     """
-    now = now_local()
-    time_str = time_str.strip()
-    if not time_str.isdigit() or len(time_str) not in (3, 4):
-        raise ValueError("Time must be HMM or HHMM, e.g. 215 or 0215.")
+    s = time_str.strip()
+    if not s.isdigit() or len(s) not in (3, 4):
+        raise ValueError("Time must be HMM or HHMM")
 
-    if len(time_str) == 3:
-        hour = int(time_str[0])
-        minute = int(time_str[1:])
+    if len(s) == 3:
+        hour = int(s[0])
+        minute = int(s[1:])
     else:
-        hour = int(time_str[:2])
-        minute = int(time_str[2:])
+        hour = int(s[:2])
+        minute = int(s[2:])
 
     if not (0 <= hour <= 23 and 0 <= minute <= 59):
-        raise ValueError("Invalid hour/minute values.")
+        raise ValueError("Invalid numeric time")
 
+    if for_date:
+        return datetime(for_date.year, for_date.month, for_date.day,
+                        hour, minute, tzinfo=TIMEZONE)
+
+    # No explicit date → fallback to latest matching time (today or yesterday)
+    now = now_local()
     dt = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
-
-    # If that clock time is still in our future, assume it was yesterday
     if dt > now:
         dt -= timedelta(days=1)
-
     return dt
 
+# ------------------------------------------------------------
+# Fuzzy Matching (Option A)
+# ------------------------------------------------------------
+
+def fuzzy_find_mob(name: str, mobs: dict):
+    """
+    Option A:
+      - Exact match → return key
+      - One close fuzzy match → return that key
+      - Multiple close matches → return list of keys
+      - No match → return None
+    """
+    name = name.lower().strip()
+
+    if name in mobs:
+        return name
+
+    keys = list(mobs.keys())
+    close = get_close_matches(name, keys, n=3, cutoff=0.6)
+
+    if len(close) == 1:
+        return close[0]
+
+    if len(close) > 1:
+        return close  # ambiguous
+
+    return None  # no match
+
+# ------------------------------------------------------------
+# Auto-Learning Spawn Window
+# ------------------------------------------------------------
 
 def update_window_from_tod_history(mob_data: dict):
     """
-    Use the mob's TOD history to auto-learn a spawn window.
-    Stores:
-      mob_data["min_respawn_hours"]
-      mob_data["max_respawn_hours"]
-      mob_data["learned_confidence"]
-
-    Returns: (min_h, max_h, confidence) or (None, None, "LOW") if not enough data.
+    Given list of TOD strings, compute:
+    - min_respawn_hours
+    - max_respawn_hours
+    - learned_confidence
     """
     history = mob_data.get("tod_history", [])
     if len(history) < 2:
         mob_data["learned_confidence"] = "LOW"
         return None, None, "LOW"
 
-    # Parse and sort TODs (aware datetimes in TIMEZONE)
     times = sorted(datetime.fromisoformat(t) for t in history)
     intervals = []
+
     for a, b in zip(times, times[1:]):
-        delta_hours = (b - a).total_seconds() / 3600.0
-        # Ignore obviously bogus tiny values (<15 minutes)
-        if delta_hours > 0.25:
-            intervals.append(delta_hours)
+        hours = (b - a).total_seconds() / 3600.0
+        if hours > 0.25:  # prevent tiny intervals
+            intervals.append(hours)
 
     if not intervals:
         mob_data["learned_confidence"] = "LOW"
         return None, None, "LOW"
 
     intervals.sort()
-    trimmed = intervals
 
-    # If we have 4+ samples, drop one smallest and one largest as outliers
-    if len(intervals) >= 4:
-        trimmed = intervals[1:-1]
+    # Trim outliers if enough data
+    trimmed = intervals[1:-1] if len(intervals) >= 4 else intervals
 
-    min_h = min(trimmed) * 0.95  # small safety margin
+    min_h = min(trimmed) * 0.95
     max_h = max(trimmed) * 1.05
 
-    # Confidence based on count of intervals
+    # Confidence
     n = len(intervals)
     if n < 3:
-        confidence = "LOW"
+        conf = "LOW"
     elif n < 6:
-        confidence = "MEDIUM"
+        conf = "MEDIUM"
     else:
-        confidence = "HIGH"
+        conf = "HIGH"
 
     mob_data["min_respawn_hours"] = round(min_h, 2)
     mob_data["max_respawn_hours"] = round(max_h, 2)
-    mob_data["learned_confidence"] = confidence
+    mob_data["learned_confidence"] = conf
 
-    return mob_data["min_respawn_hours"], mob_data["max_respawn_hours"], confidence
+    return mob_data["min_respawn_hours"], mob_data["max_respawn_hours"], conf
 
+# ------------------------------------------------------------
+# Status Line Builder
+# ------------------------------------------------------------
 
-def mob_status_line(mob_name: str, mob_data: dict, now_time: datetime) -> str:
-    """Build a single status line for a mob, including confidence info."""
+def mob_status_line(mob_key: str, mob_data: dict, now: datetime) -> str:
+    """
+    Generate text line for !status and auto-updater.
+    """
+    name = mob_data.get("display_name", mob_key)
+
     if not mob_data.get("tracking", False):
-        return f"❌ {mob_data.get('display_name', mob_name)} — tracking OFF"
+        return f"❌ {name} — tracking OFF"
 
     min_h = mob_data.get("min_respawn_hours")
     max_h = mob_data.get("max_respawn_hours")
     last_death = mob_data.get("last_death")
     last_spawn = mob_data.get("last_spawn")
-    confidence = mob_data.get("learned_confidence")
-    conf_suffix = f" (confidence: {confidence})" if confidence else ""
+    conf = mob_data.get("learned_confidence", "LOW")
 
     if min_h is None or max_h is None:
-        return (f"⚠️ {mob_data.get('display_name', mob_name)} — spawn window not set "
-                f"(`!setwindow {mob_name} min max`)")
+        return f"⚠️ {name} — no spawn window (`!setwindow {name} min max`)"
 
     base_time = None
     if last_death:
@@ -223,29 +250,26 @@ def mob_status_line(mob_name: str, mob_data: dict, now_time: datetime) -> str:
     elif last_spawn:
         base_time = datetime.fromisoformat(last_spawn)
 
-    if base_time is None:
-        return f"ℹ️ {mob_data.get('display_name', mob_name)} — no TOD or spawn recorded yet." + conf_suffix
+    if not base_time:
+        return f"ℹ️ {name} — no TOD or spawn recorded yet. (confidence: {conf})"
 
     earliest = base_time + timedelta(hours=min_h)
     latest = base_time + timedelta(hours=max_h)
 
-    if now_time < earliest:
-        until_open = earliest - now_time
-        return (f"⏳ {mob_data.get('display_name', mob_name)} — window CLOSED, "
-                f"opens in **{format_timedelta(until_open)}**" + conf_suffix)
-    elif earliest <= now_time <= latest:
-        until_close = latest - now_time
-        return (f"✅ {mob_data.get('display_name', mob_name)} — **WINDOW OPEN**, "
-                f"~{format_timedelta(until_close)} left until late limit" + conf_suffix)
-    else:
-        overdue = now_time - latest
-        return (f"🔥 {mob_data.get('display_name', mob_name)} — window OVERDUE by "
-                f"**{format_timedelta(overdue)}** (likely up / killed unseen)" + conf_suffix)
+    if now < earliest:
+        return (f"⏳ {name} — window CLOSED, opens in "
+                f"**{format_timedelta(earliest - now)}** (confidence: {conf})")
 
+    if earliest <= now <= latest:
+        return (f"✅ {name} — **WINDOW OPEN**, ~"
+                f"{format_timedelta(latest - now)} left (confidence: {conf})")
 
-# -----------------------
-# Bot events & tasks
-# -----------------------
+    return (f"🔥 {name} — window OVERDUE by "
+            f"**{format_timedelta(now - latest)}** (confidence: {conf})")
+
+# ------------------------------------------------------------
+# Bot Events / Background Loop
+# ------------------------------------------------------------
 
 @bot.event
 async def on_ready():
@@ -253,104 +277,138 @@ async def on_ready():
     if not update_status_messages.is_running():
         update_status_messages.start()
 
-
 @bot.event
 async def on_command_error(ctx, error):
-    # Simple error handler so you see issues in Discord and console
-    print(f"Command error: {error}")
+    """User-friendly error printing."""
     try:
         await ctx.send(f"Error: `{error}`")
     except Exception:
         pass
-
+    print(f"[ERROR] {error}")
 
 @tasks.loop(seconds=60)
 async def update_status_messages():
-    now_time = now_local()
+    """Auto-refresh status board."""
+    now = now_local()
     all_data = load_data()
 
     for guild in bot.guilds:
         gid = str(guild.id)
-        guild_data = all_data.get(gid)
-        if not guild_data:
+        gdata = all_data.get(gid)
+        if not gdata:
             continue
 
-        channel_id = guild_data.get("status_channel_id")
-        message_id = guild_data.get("status_message_id")
-        mobs = guild_data.get("mobs", {})
+        chan_id = gdata.get("status_channel_id")
+        msg_id = gdata.get("status_message_id")
+        mobs = gdata.get("mobs", {})
 
-        if not channel_id:
+        if not chan_id:
             continue
 
-        channel = guild.get_channel(channel_id)
+        channel = guild.get_channel(chan_id)
         if not channel:
             continue
 
         if not mobs:
-            content = "No mobs are being tracked yet. Use `!track MobName` to start."
+            content = "No mobs tracked. Use `!track MobName`."
         else:
-            lines = []
-            for key, mob_data in mobs.items():
-                if mob_data.get("tracking", False):
-                    lines.append(mob_status_line(key, mob_data, now_time))
-            if not lines:
-                content = "No mobs are currently set to tracking ON."
-            else:
-                content = "__**Contested Mob Spawn Windows**__\n" + "\n".join(lines)
+            lines = [
+                mob_status_line(key, mob, now)
+                for key, mob in mobs.items()
+                if mob.get("tracking", False)
+            ]
+            content = "__**Contested Mob Spawn Windows**__\n" + "\n".join(lines) if lines else "No mobs with tracking ON."
 
         try:
-            if message_id:
-                msg = await channel.fetch_message(message_id)
+            if msg_id:
+                msg = await channel.fetch_message(msg_id)
                 await msg.edit(content=content)
             else:
                 msg = await channel.send(content)
-                guild_data["status_message_id"] = msg.id
-                update_guild_data(guild.id, guild_data)
+                gdata["status_message_id"] = msg.id
+                update_guild_data(guild.id, gdata)
+
         except discord.NotFound:
             msg = await channel.send(content)
-            guild_data["status_message_id"] = msg.id
-            update_guild_data(guild.id, guild_data)
+            gdata["status_message_id"] = msg.id
+            update_guild_data(guild.id, gdata)
+
         except discord.Forbidden:
             continue
+# ------------------------------------------------------------
+# TOD Command (explicit date + fuzzy)
+# ------------------------------------------------------------
 
-
-# -----------------------
-# Commands
-# -----------------------
-
-@bot.command(help="Mark Time Of Death. Usage: !tod Mob Name [HHMM]")
+@bot.command(
+    help=(
+        "Record a Time of Death.\n"
+        "Usage:\n"
+        "  !tod MobName HHMM\n"
+        "  !tod MobName YYYY-MM-DD HHMM\n"
+        "  !tod MobName MM/DD/YYYY HHMM\n"
+        "Examples:\n"
+        "  !tod Pumpkinhead 0200\n"
+        "  !tod Haraghur 2025-12-05 0210\n"
+        "  !tod Vraksakin 12/05/2025 0630"
+    )
+)
 async def tod(ctx, *, mob_and_time: str):
-    """Record TOD and auto-learn window from TOD history (canonical timezone)."""
-    current = now_local()
-
+    now = now_local()
     parts = mob_and_time.split()
-    time_str = None
 
-    # If last token looks like HMM/HHMM digits, treat as time
-    if parts and parts[-1].isdigit() and len(parts[-1]) in (3, 4):
-        time_str = parts[-1]
-        mob_name = " ".join(parts[:-1])
-    else:
-        mob_name = mob_and_time
+    time_token = None
+    date_obj = None
 
-    mob_name = mob_name.strip()
+    # Identify time token:
+    if parts and looks_like_time(parts[-1]):
+        time_token = parts[-1]
+        parts = parts[:-1]
+
+    # Identify date:
+    if parts:
+        possible_date = parts[-1]
+        try:
+            date_obj = parse_date_str(possible_date)
+            parts = parts[:-1]
+        except ValueError:
+            date_obj = None
+
+    mob_name = " ".join(parts).strip()
     if not mob_name:
-        await ctx.send("Please specify a mob name, e.g. `!tod Pumpkinhead`.")
+        await ctx.send("Error: You must specify a mob name.")
         return
 
-    if time_str:
+    # If date provided but no time:
+    if date_obj and not time_token:
+        await ctx.send("You must provide both date AND time. Example: `!tod Pumpkinhead 2025-12-05 0200`")
+        return
+
+    # Determine TOD timestamp:
+    if time_token:
         try:
-            tod_time = parse_time_str(time_str)
+            tod_time = parse_time_str(time_token, for_date=date_obj)
         except ValueError as e:
             await ctx.send(f"Invalid time: {e}")
             return
     else:
-        tod_time = current
+        tod_time = now
 
-    guild_data = get_guild_data(ctx.guild.id)
-    mobs = guild_data["mobs"]
-    key = normalize_mob_name(mob_name)
+    # Load DB:
+    gdata = get_guild_data(ctx.guild.id)
+    mobs = gdata["mobs"]
 
+    # Fuzzy match:
+    raw_key = normalize_mob_name(mob_name)
+    fuzzy = fuzzy_find_mob(raw_key, mobs)
+
+    if isinstance(fuzzy, list):
+        await ctx.send("Mob name ambiguous. Did you mean:\n" +
+                       "\n".join(f" • {mobs[k]['display_name']}" for k in fuzzy))
+        return
+
+    key = fuzzy if isinstance(fuzzy, str) else raw_key
+
+    # Create mob entry if needed:
     if key not in mobs:
         mobs[key] = {
             "display_name": mob_name,
@@ -367,36 +425,35 @@ async def tod(ctx, *, mob_and_time: str):
     mob["display_name"] = mob_name
     mob["last_death"] = tod_time.isoformat()
 
-    # Record TOD history & auto-learn
+    # TOD history update:
     history = mob.get("tod_history", [])
     history.append(tod_time.isoformat())
-    history = sorted(history)[-10:]  # keep last 10
-    mob["tod_history"] = history
+    mob["tod_history"] = sorted(history)[-10:]  # keep last 10
 
-    min_h, max_h, confidence = update_window_from_tod_history(mob)
+    # Auto-learn:
+    min_h, max_h, conf = update_window_from_tod_history(mob)
 
-    guild_data["mobs"] = mobs
-    update_guild_data(ctx.guild.id, guild_data)
+    update_guild_data(ctx.guild.id, gdata)
 
-    tod_local_str = tod_time.strftime("%Y-%m-%d %H:%M")
-    msg = f"☠️ Recorded TOD for **{mob_name}** at `{tod_local_str}`."
-
-    if min_h is not None and max_h is not None:
-        msg += f"\n🧠 Auto-learned window: **{min_h}–{max_h} hours** (confidence: {confidence})."
-
+    when = tod_time.strftime("%Y-%m-%d %H:%M")
+    msg = f"☠️ Recorded TOD for **{mob_name}** at `{when}`."
+    if min_h is not None:
+        msg += f"\n🧠 Auto-learned window: **{min_h}–{max_h} hours** (confidence: {conf})."
     await ctx.send(msg)
 
 
-@bot.command(help="Mark a spawn time. Usage: !spawn Mob Name [HHMM]")
+# ------------------------------------------------------------
+# SPAWN Command
+# ------------------------------------------------------------
+
+@bot.command(help="Record a mob's spawn time. Usage: !spawn MobName [HHMM]")
 async def spawn(ctx, *, mob_and_time: str):
-    """Record when you actually saw the mob spawn (canonical timezone)."""
-    current = now_local()
-
+    now = now_local()
     parts = mob_and_time.split()
-    time_str = None
 
-    if parts and parts[-1].isdigit() and len(parts[-1]) in (3, 4):
-        time_str = parts[-1]
+    time_token = None
+    if parts and looks_like_time(parts[-1]):
+        time_token = parts[-1]
         mob_name = " ".join(parts[:-1])
     else:
         mob_name = mob_and_time
@@ -406,19 +463,29 @@ async def spawn(ctx, *, mob_and_time: str):
         await ctx.send("Usage: `!spawn MobName [HHMM]`")
         return
 
-    if time_str:
+    if time_token:
         try:
-            spawn_time = parse_time_str(time_str)
+            spawn_time = parse_time_str(time_token)
         except ValueError as e:
             await ctx.send(f"Invalid time: {e}")
             return
     else:
-        spawn_time = current
+        spawn_time = now
 
-    guild_data = get_guild_data(ctx.guild.id)
-    mobs = guild_data["mobs"]
-    key = normalize_mob_name(mob_name)
+    # Load DB:
+    gdata = get_guild_data(ctx.guild.id)
+    mobs = gdata["mobs"]
 
+    # Fuzzy:
+    raw_key = normalize_mob_name(mob_name)
+    fuzzy = fuzzy_find_mob(raw_key, mobs)
+    if isinstance(fuzzy, list):
+        await ctx.send("Ambiguous mob name. Did you mean:\n" +
+                       "\n".join(f" • {mobs[k]['display_name']}" for k in fuzzy))
+        return
+    key = fuzzy if isinstance(fuzzy, str) else raw_key
+
+    # Create if new:
     if key not in mobs:
         mobs[key] = {
             "display_name": mob_name,
@@ -435,24 +502,30 @@ async def spawn(ctx, *, mob_and_time: str):
     mob["display_name"] = mob_name
     mob["last_spawn"] = spawn_time.isoformat()
 
-    guild_data["mobs"] = mobs
-    update_guild_data(ctx.guild.id, guild_data)
+    update_guild_data(ctx.guild.id, gdata)
 
-    spawn_local_str = spawn_time.strftime("%Y-%m-%d %H:%M")
-    await ctx.send(f"🌱 Recorded spawn for **{mob_name}** at `{spawn_local_str}`.")
+    when = spawn_time.strftime("%Y-%m-%d %H:%M")
+    await ctx.send(f"🌱 Recorded spawn for **{mob_name}** at `{when}`.")
 
 
-@bot.command(help="Begin tracking a mob. Usage: !track MobName")
+# ------------------------------------------------------------
+# TRACK / UNTRACK
+# ------------------------------------------------------------
+
+@bot.command(help="Start tracking a mob. Usage: !track MobName")
 async def track(ctx, *, mob_name: str):
-    """Turn tracking ON only. Never toggles off."""
-    mob_name = mob_name.strip()
-    if not mob_name:
-        await ctx.send("Usage: `!track Mob Name`")
+    gdata = get_guild_data(ctx.guild.id)
+    mobs = gdata["mobs"]
+
+    raw_key = normalize_mob_name(mob_name)
+    fuzzy = fuzzy_find_mob(raw_key, mobs)
+
+    if isinstance(fuzzy, list):
+        await ctx.send("Ambiguous mob name. Did you mean:\n" +
+                       "\n".join(f" • {mobs[k]['display_name']}" for k in fuzzy))
         return
 
-    guild_data = get_guild_data(ctx.guild.id)
-    mobs = guild_data["mobs"]
-    key = normalize_mob_name(mob_name)
+    key = fuzzy if isinstance(fuzzy, str) else raw_key
 
     if key not in mobs:
         mobs[key] = {
@@ -466,55 +539,58 @@ async def track(ctx, *, mob_name: str):
             "learned_confidence": "LOW",
         }
     else:
-        mob = mobs[key]
-        mob["display_name"] = mob_name
-        mob["tracking"] = True
+        mobs[key]["display_name"] = mob_name
+        mobs[key]["tracking"] = True
 
-    update_guild_data(ctx.guild.id, guild_data)
-    await ctx.send(f"Tracking for **{mob_name}** is now **ON**.")
+    update_guild_data(ctx.guild.id, gdata)
+    await ctx.send(f"🟢 Tracking **{mob_name}** enabled.")
 
-
-@bot.command(help="Stop tracking a mob (keeps its history). Usage: !untrack MobName")
+@bot.command(help="Stop tracking a mob (keeps its data). Usage: !untrack MobName")
 async def untrack(ctx, *, mob_name: str):
-    mob_name = mob_name.strip()
-    if not mob_name:
-        await ctx.send("Usage: `!untrack Mob Name`")
-        return
+    gdata = get_guild_data(ctx.guild.id)
+    mobs = gdata["mobs"]
 
-    guild_data = get_guild_data(ctx.guild.id)
-    mobs = guild_data["mobs"]
-    key = normalize_mob_name(mob_name)
+    raw_key = normalize_mob_name(mob_name)
+    fuzzy = fuzzy_find_mob(raw_key, mobs)
+    if isinstance(fuzzy, list):
+        await ctx.send("Ambiguous mob name. Did you mean:\n" +
+                       "\n".join(f" • {mobs[k]['display_name']}" for k in fuzzy))
+        return
+    key = fuzzy if isinstance(fuzzy, str) else raw_key
 
     if key not in mobs:
-        await ctx.send(f"Mob **{mob_name}** is not being tracked.")
+        await ctx.send(f"Mob **{mob_name}** not found.")
         return
 
     mobs[key]["tracking"] = False
-    update_guild_data(ctx.guild.id, guild_data)
+    update_guild_data(ctx.guild.id, gdata)
+    await ctx.send(f"🔴 Tracking **{mobs[key]['display_name']}** disabled.")
 
-    await ctx.send(f"Tracking for **{mob_name}** is now **OFF**.")
 
+# ------------------------------------------------------------
+# DELETE / RENAME / UNDO
+# ------------------------------------------------------------
 
-@bot.command(help="Permanently removes a mob from tracking. Usage: !deletemob MobName")
+@bot.command(help="Delete a mob entirely. Usage: !deletemob MobName")
 async def deletemob(ctx, *, mob_name: str):
-    mob_name = mob_name.strip()
-    if not mob_name:
-        await ctx.send("Usage: `!deletemob Mob Name`")
+    gdata = get_guild_data(ctx.guild.id)
+    mobs = gdata["mobs"]
+
+    raw_key = normalize_mob_name(mob_name)
+    fuzzy = fuzzy_find_mob(raw_key, mobs)
+    if isinstance(fuzzy, list):
+        await ctx.send("Ambiguous mob name:\n" +
+                       "\n".join(f" • {mobs[k]['display_name']}" for k in fuzzy))
         return
 
-    guild_data = get_guild_data(ctx.guild.id)
-    mobs = guild_data["mobs"]
-    key = normalize_mob_name(mob_name)
-
+    key = fuzzy if isinstance(fuzzy, str) else raw_key
     if key not in mobs:
-        await ctx.send(f"Mob **{mob_name}** does not exist in tracking.")
+        await ctx.send(f"Mob **{mob_name}** not found.")
         return
 
     del mobs[key]
-    update_guild_data(ctx.guild.id, guild_data)
-
-    await ctx.send(f"🗑️ **{mob_name}** has been fully removed from tracking.")
-
+    update_guild_data(ctx.guild.id, gdata)
+    await ctx.send(f"🗑️ Deleted mob **{mob_name}**.")
 
 @bot.command(help="Rename a mob. Usage: !renamemob Old Name | New Name")
 async def renamemob(ctx, *, args: str):
@@ -522,21 +598,25 @@ async def renamemob(ctx, *, args: str):
         await ctx.send("Usage: `!renamemob Old Name | New Name`")
         return
 
-    old_name, new_name = [part.strip() for part in args.split("|", 1)]
-    if not old_name or not new_name:
-        await ctx.send("Usage: `!renamemob Old Name | New Name`")
+    old_name, new_name = [s.strip() for s in args.split("|", 1)]
+
+    gdata = get_guild_data(ctx.guild.id)
+    mobs = gdata["mobs"]
+
+    # Fuzzy match old name
+    raw_key = normalize_mob_name(old_name)
+    fuzzy = fuzzy_find_mob(raw_key, mobs)
+    if isinstance(fuzzy, list):
+        await ctx.send("Ambiguous original name:\n" +
+                       "\n".join(f" • {mobs[k]['display_name']}" for k in fuzzy))
         return
-
-    guild_data = get_guild_data(ctx.guild.id)
-    mobs = guild_data["mobs"]
-
-    old_key = normalize_mob_name(old_name)
-    new_key = normalize_mob_name(new_name)
+    old_key = fuzzy if isinstance(fuzzy, str) else raw_key
 
     if old_key not in mobs:
         await ctx.send(f"Mob **{old_name}** not found.")
         return
 
+    new_key = normalize_mob_name(new_name)
     if new_key in mobs and new_key != old_key:
         await ctx.send(f"A mob named **{new_name}** already exists.")
         return
@@ -545,30 +625,32 @@ async def renamemob(ctx, *, args: str):
     mob["display_name"] = new_name
     mobs[new_key] = mob
 
-    update_guild_data(ctx.guild.id, guild_data)
-    await ctx.send(f"✏️ Renamed mob **{old_name}** → **{new_name}**.")
+    update_guild_data(ctx.guild.id, gdata)
+    await ctx.send(f"✏️ Renamed **{old_name}** → **{new_name}**.")
 
-
-@bot.command(help="Removes the most recent TOD entry for a mob. Usage: !undo MobName")
+@bot.command(help="Undo the last TOD entry. Usage: !undo MobName")
 async def undo(ctx, *, mob_name: str):
-    mob_name = mob_name.strip()
-    if not mob_name:
-        await ctx.send("Usage: `!undo MobName`")
+    gdata = get_guild_data(ctx.guild.id)
+    mobs = gdata["mobs"]
+
+    raw_key = normalize_mob_name(mob_name)
+    fuzzy = fuzzy_find_mob(raw_key, mobs)
+    if isinstance(fuzzy, list):
+        await ctx.send("Ambiguous name:\n" +
+                       "\n".join(f" • {mobs[k]['display_name']}" for k in fuzzy))
         return
 
-    guild_data = get_guild_data(ctx.guild.id)
-    mobs = guild_data["mobs"]
-    key = normalize_mob_name(mob_name)
+    key = fuzzy if isinstance(fuzzy, str) else raw_key
 
     if key not in mobs:
-        await ctx.send(f"Mob **{mob_name}** is not tracked.")
+        await ctx.send(f"Mob **{mob_name}** not tracked.")
         return
 
     mob = mobs[key]
     history = mob.get("tod_history", [])
 
     if not history:
-        await ctx.send(f"No TOD history exists for **{mob_name}**.")
+        await ctx.send(f"No TOD history for **{mob['display_name']}**.")
         return
 
     removed = history.pop()
@@ -576,53 +658,50 @@ async def undo(ctx, *, mob_name: str):
 
     if len(history) >= 2:
         min_h, max_h, conf = update_window_from_tod_history(mob)
-        msg = (
-            f"↩️ Removed last TOD entry (`{removed}`).\n"
-            f"🧠 Updated auto-learned window: **{min_h}–{max_h} hours** (confidence: {conf})."
-        )
+        msg = (f"↩️ Removed last TOD (`{removed}`).\n"
+               f"New window: **{min_h}–{max_h} hours** (confidence: {conf}).")
     else:
         mob["min_respawn_hours"] = None
         mob["max_respawn_hours"] = None
         mob["learned_confidence"] = "LOW"
         msg = (
-            f"↩️ Removed last TOD entry (`{removed}`).\n"
-            f"⚠️ Not enough TODs left to compute a window."
+            f"↩️ Removed last TOD (`{removed}`).\n"
+            f"Not enough TOD data to compute a window."
         )
 
-    update_guild_data(ctx.guild.id, guild_data)
+    update_guild_data(ctx.guild.id, gdata)
     await ctx.send(msg)
 
 
-@bot.command(help="Set a mob's spawn window manually. Usage: !setwindow MobName min max")
+# ------------------------------------------------------------
+# SET WINDOW
+# ------------------------------------------------------------
+
+@bot.command(help="Set spawn window manually. Usage: !setwindow MobName min max")
 async def setwindow(ctx, *, args: str):
-    """
-    Example:
-      !setwindow Pumpkinhead 8 12
-    """
     parts = args.split()
     if len(parts) < 3:
-        await ctx.send("Usage: `!setwindow MobName min max` (hours). Example: `!setwindow Pumpkinhead 8 12`")
+        await ctx.send("Usage: `!setwindow MobName min max`")
         return
 
     try:
         min_h = float(parts[-2])
         max_h = float(parts[-1])
     except ValueError:
-        await ctx.send("The last two values must be numbers (hours). Example: `!setwindow Pumpkinhead 8 12`")
+        await ctx.send("min and max must be numbers.")
         return
 
-    if min_h <= 0 or max_h <= 0 or min_h > max_h:
-        await ctx.send("Invalid window. Require: min > 0, max > 0, and min <= max.")
-        return
+    mob_name = " ".join(parts[:-2])
+    gdata = get_guild_data(ctx.guild.id)
+    mobs = gdata["mobs"]
 
-    mob_name = " ".join(parts[:-2]).strip()
-    if not mob_name:
-        await ctx.send("Please include the mob name before the min/max hours.")
+    raw_key = normalize_mob_name(mob_name)
+    fuzzy = fuzzy_find_mob(raw_key, mobs)
+    if isinstance(fuzzy, list):
+        await ctx.send("Ambiguous mob name:\n" +
+                       "\n".join(f" • {mobs[k]['display_name']}" for k in fuzzy))
         return
-
-    guild_data = get_guild_data(ctx.guild.id)
-    mobs = guild_data["mobs"]
-    key = normalize_mob_name(mob_name)
+    key = fuzzy if isinstance(fuzzy, str) else raw_key
 
     if key not in mobs:
         mobs[key] = {
@@ -636,58 +715,65 @@ async def setwindow(ctx, *, args: str):
             "learned_confidence": "LOW",
         }
     else:
-        mob = mobs[key]
-        mob["display_name"] = mob_name
-        mob["min_respawn_hours"] = min_h
-        mob["max_respawn_hours"] = max_h
+        mobs[key]["min_respawn_hours"] = min_h
+        mobs[key]["max_respawn_hours"] = max_h
 
-    update_guild_data(ctx.guild.id, guild_data)
-    await ctx.send(f"⏱️ Window for **{mob_name}** set to **{min_h}–{max_h} hours**.")
+    update_guild_data(ctx.guild.id, gdata)
+    await ctx.send(f"⏱️ Window for **{mob_name}** set to **{min_h}-{max_h} hours**.")
 
 
-@bot.command(help="Set the channel where the auto-updating spawn list will appear.")
+# ------------------------------------------------------------
+# STATUS CHANNEL
+# ------------------------------------------------------------
+
+@bot.command(help="Set the channel used for auto-updating status board.")
 @commands.has_permissions(manage_channels=True)
 async def setstatuschannel(ctx, channel: discord.TextChannel = None):
     if channel is None:
         channel = ctx.channel
 
-    guild_data = get_guild_data(ctx.guild.id)
-    guild_data["status_channel_id"] = channel.id
-    guild_data["status_message_id"] = None
-    update_guild_data(ctx.guild.id, guild_data)
+    gdata = get_guild_data(ctx.guild.id)
+    gdata["status_channel_id"] = channel.id
+    gdata["status_message_id"] = None
 
-    await ctx.send(f"✅ Status updates will now appear in {channel.mention}.")
+    update_guild_data(ctx.guild.id, gdata)
+
+    await ctx.send(f"📡 Status updates will now appear in {channel.mention}.")
 
 
-@bot.command(help="Show immediate spawn status.")
+# ------------------------------------------------------------
+# STATUS (manual)
+# ------------------------------------------------------------
+
+@bot.command(help="Show current spawn windows.")
 async def status(ctx):
-    now_time = now_local()
-    guild_data = get_guild_data(ctx.guild.id)
-    mobs = guild_data.get("mobs", {})
+    now = now_local()
+    gdata = get_guild_data(ctx.guild.id)
+    mobs = gdata.get("mobs", {})
 
     if not mobs:
-        await ctx.send("No mobs are being tracked. Use `!track MobName` to start.")
+        await ctx.send("No mobs tracked.")
         return
 
-    lines = []
-    for key, mob_data in mobs.items():
-        if mob_data.get("tracking", False):
-            lines.append(mob_status_line(key, mob_data, now_time))
+    lines = [
+        mob_status_line(key, mob, now)
+        for key, mob in mobs.items()
+        if mob.get("tracking", False)
+    ]
 
     if not lines:
-        await ctx.send("No mobs currently have tracking enabled.")
+        await ctx.send("No mobs have tracking enabled.")
         return
 
-    content = "__**Contested Mob Spawn Windows**__\n" + "\n".join(lines)
-    await ctx.send(content)
+    await ctx.send("__**Contested Mob Spawn Windows**__\n" + "\n".join(lines))
 
 
-# -----------------------
-# Run bot
-# -----------------------
+# ------------------------------------------------------------
+# RUN BOT
+# ------------------------------------------------------------
 
 if __name__ == "__main__":
     if not TOKEN:
-        print("ERROR: DISCORD_TOKEN not found in environment.")
+        print("ERROR: DISCORD_TOKEN not set.")
     else:
         bot.run(TOKEN)
