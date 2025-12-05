@@ -14,11 +14,7 @@ from dotenv import load_dotenv
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 
-# Change this if you want a different canonical timezone
-# Examples:
-#   "America/Los_Angeles" (Pacific)
-#   "America/Chicago"
-#   "UTC"
+# Canonical EQ2 timezone: Eastern with DST (EST/EDT)
 TIMEZONE = ZoneInfo("America/New_York")
 
 INTENTS = discord.Intents.all()
@@ -330,6 +326,7 @@ async def tod(ctx, *, mob_and_time: str):
     parts = mob_and_time.split()
     time_str = None
 
+    # If last token looks like HMM/HHMM digits, treat as time
     if parts and parts[-1].isdigit() and len(parts[-1]) in (3, 4):
         time_str = parts[-1]
         mob_name = " ".join(parts[:-1])
@@ -362,7 +359,8 @@ async def tod(ctx, *, mob_and_time: str):
             "max_respawn_hours": None,
             "last_death": None,
             "last_spawn": None,
-            "tod_history": []
+            "tod_history": [],
+            "learned_confidence": "LOW",
         }
 
     mob = mobs[key]
@@ -429,7 +427,8 @@ async def spawn(ctx, *, mob_and_time: str):
             "max_respawn_hours": None,
             "last_death": None,
             "last_spawn": None,
-            "tod_history": []
+            "tod_history": [],
+            "learned_confidence": "LOW",
         }
 
     mob = mobs[key]
@@ -443,9 +442,9 @@ async def spawn(ctx, *, mob_and_time: str):
     await ctx.send(f"🌱 Recorded spawn for **{mob_name}** at `{spawn_local_str}`.")
 
 
-@bot.command(help="Toggle tracking for a mob on/off. Usage: !track MobName")
+@bot.command(help="Begin tracking a mob. Usage: !track MobName")
 async def track(ctx, *, mob_name: str):
-    """Turn tracking on/off for a mob, creating it if needed."""
+    """Turn tracking ON only. Never toggles off."""
     mob_name = mob_name.strip()
     if not mob_name:
         await ctx.send("Usage: `!track Mob Name`")
@@ -463,19 +462,135 @@ async def track(ctx, *, mob_name: str):
             "max_respawn_hours": None,
             "last_death": None,
             "last_spawn": None,
-            "tod_history": []
+            "tod_history": [],
+            "learned_confidence": "LOW",
         }
-        state = "ON"
     else:
         mob = mobs[key]
         mob["display_name"] = mob_name
-        mob["tracking"] = not mob.get("tracking", False)
-        state = "ON" if mob["tracking"] else "OFF"
+        mob["tracking"] = True
 
-    guild_data["mobs"] = mobs
+    update_guild_data(ctx.guild.id, guild_data)
+    await ctx.send(f"Tracking for **{mob_name}** is now **ON**.")
+
+
+@bot.command(help="Stop tracking a mob (keeps its history). Usage: !untrack MobName")
+async def untrack(ctx, *, mob_name: str):
+    mob_name = mob_name.strip()
+    if not mob_name:
+        await ctx.send("Usage: `!untrack Mob Name`")
+        return
+
+    guild_data = get_guild_data(ctx.guild.id)
+    mobs = guild_data["mobs"]
+    key = normalize_mob_name(mob_name)
+
+    if key not in mobs:
+        await ctx.send(f"Mob **{mob_name}** is not being tracked.")
+        return
+
+    mobs[key]["tracking"] = False
     update_guild_data(ctx.guild.id, guild_data)
 
-    await ctx.send(f"Tracking for **{mob_name}** is now **{state}**.")
+    await ctx.send(f"Tracking for **{mob_name}** is now **OFF**.")
+
+
+@bot.command(help="Permanently removes a mob from tracking. Usage: !deletemob MobName")
+async def deletemob(ctx, *, mob_name: str):
+    mob_name = mob_name.strip()
+    if not mob_name:
+        await ctx.send("Usage: `!deletemob Mob Name`")
+        return
+
+    guild_data = get_guild_data(ctx.guild.id)
+    mobs = guild_data["mobs"]
+    key = normalize_mob_name(mob_name)
+
+    if key not in mobs:
+        await ctx.send(f"Mob **{mob_name}** does not exist in tracking.")
+        return
+
+    del mobs[key]
+    update_guild_data(ctx.guild.id, guild_data)
+
+    await ctx.send(f"🗑️ **{mob_name}** has been fully removed from tracking.")
+
+
+@bot.command(help="Rename a mob. Usage: !renamemob Old Name | New Name")
+async def renamemob(ctx, *, args: str):
+    if "|" not in args:
+        await ctx.send("Usage: `!renamemob Old Name | New Name`")
+        return
+
+    old_name, new_name = [part.strip() for part in args.split("|", 1)]
+    if not old_name or not new_name:
+        await ctx.send("Usage: `!renamemob Old Name | New Name`")
+        return
+
+    guild_data = get_guild_data(ctx.guild.id)
+    mobs = guild_data["mobs"]
+
+    old_key = normalize_mob_name(old_name)
+    new_key = normalize_mob_name(new_name)
+
+    if old_key not in mobs:
+        await ctx.send(f"Mob **{old_name}** not found.")
+        return
+
+    if new_key in mobs and new_key != old_key:
+        await ctx.send(f"A mob named **{new_name}** already exists.")
+        return
+
+    mob = mobs.pop(old_key)
+    mob["display_name"] = new_name
+    mobs[new_key] = mob
+
+    update_guild_data(ctx.guild.id, guild_data)
+    await ctx.send(f"✏️ Renamed mob **{old_name}** → **{new_name}**.")
+
+
+@bot.command(help="Removes the most recent TOD entry for a mob. Usage: !undo MobName")
+async def undo(ctx, *, mob_name: str):
+    mob_name = mob_name.strip()
+    if not mob_name:
+        await ctx.send("Usage: `!undo MobName`")
+        return
+
+    guild_data = get_guild_data(ctx.guild.id)
+    mobs = guild_data["mobs"]
+    key = normalize_mob_name(mob_name)
+
+    if key not in mobs:
+        await ctx.send(f"Mob **{mob_name}** is not tracked.")
+        return
+
+    mob = mobs[key]
+    history = mob.get("tod_history", [])
+
+    if not history:
+        await ctx.send(f"No TOD history exists for **{mob_name}**.")
+        return
+
+    removed = history.pop()
+    mob["tod_history"] = history
+
+    if len(history) >= 2:
+        min_h, max_h, conf = update_window_from_tod_history(mob)
+        msg = (
+            f"↩️ Removed last TOD entry (`{removed}`).\n"
+            f"🧠 Updated auto-learned window: **{min_h}–{max_h} hours** (confidence: {conf})."
+        )
+    else:
+        mob["min_respawn_hours"] = None
+        mob["max_respawn_hours"] = None
+        mob["learned_confidence"] = "LOW"
+        msg = (
+            f"↩️ Removed last TOD entry (`{removed}`).\n"
+            f"⚠️ Not enough TODs left to compute a window."
+        )
+
+    update_guild_data(ctx.guild.id, guild_data)
+    await ctx.send(msg)
 
 
 @bot.command(help="Set a mob's spawn window manually. Usage: !setwindow MobName min max")
@@ -517,7 +632,8 @@ async def setwindow(ctx, *, args: str):
             "max_respawn_hours": max_h,
             "last_death": None,
             "last_spawn": None,
-            "tod_history": []
+            "tod_history": [],
+            "learned_confidence": "LOW",
         }
     else:
         mob = mobs[key]
@@ -525,9 +641,7 @@ async def setwindow(ctx, *, args: str):
         mob["min_respawn_hours"] = min_h
         mob["max_respawn_hours"] = max_h
 
-    guild_data["mobs"] = mobs
     update_guild_data(ctx.guild.id, guild_data)
-
     await ctx.send(f"⏱️ Window for **{mob_name}** set to **{min_h}–{max_h} hours**.")
 
 
