@@ -21,7 +21,7 @@ TIMEZONE = ZoneInfo("America/New_York")
 INTENTS = discord.Intents.all()
 bot = commands.Bot(command_prefix="!", intents=INTENTS)
 
-DATA_FILE = "mobs_data.json"
+DATA_FILE = os.getenv("DATA_FILE", "mobs_data.json")
 
 # ------------------------------------------------------------
 # Core Helpers (Time & Data)
@@ -43,6 +43,10 @@ def load_data():
 
 def save_data(data):
     """Persist full mob data to JSON storage."""
+    dirpath = os.path.dirname(DATA_FILE)
+    if dirpath and not os.path.exists(dirpath):
+        os.makedirs(dirpath, exist_ok=True)
+
     with open(DATA_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
 
